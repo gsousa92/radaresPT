@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
-	"github.com/gocolly/colly"
+	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/chromedp"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -52,27 +55,41 @@ func sanitizeLocationString(location string) string {
 func fetch_last_speed_controls() []SpeedControl {
 	var sc []SpeedControl
 
+	// initializing a chrome instance
+	ctx, cancel := chromedp.NewContext(
+		context.Background(),
+		chromedp.WithLogf(log.Printf),
+	)
+	defer cancel()
 
-	// TODO swap this by chromedp (example: https://www.zenrows.com/blog/web-scraping-golang#scraping-dynamic-content)
-	// to interact with the page by scrolling down and triggering lazy loading to get more results
-	c := colly.NewCollector()
+	var nodes []*cdp.Node
+	chromedp.Run(ctx,
+		chromedp.Navigate("https://temporeal.radaresdeportugal.pt/"),
+		chromedp.Nodes(".panel.panel-default", &nodes, chromedp.ByQueryAll),
+	)
 
-	c.OnHTML(".panel.panel-default ", func(e *colly.HTMLElement) {
+	for _, node := range nodes {
+		var district, created_datetime, location string
+		chromedp.Run(ctx,
+			chromedp.Text(".panel-body > h4", &district, chromedp.ByQuery, chromedp.FromNode(node), chromedp.AtLeast(0)),
+			chromedp.Text(".panel-heading > p:not(.pull-right)", &created_datetime, chromedp.ByQuery, chromedp.FromNode(node), chromedp.AtLeast(0)),
+			chromedp.Text(".panel-body > p.lead", &location, chromedp.ByQuery, chromedp.FromNode(node), chromedp.AtLeast(0)),
+		)
+
+		// For now ignore speed control if no location provided
+		if location == "" {
+			continue
+		}
+
 		speed_control := SpeedControl{
-			district:         e.ChildText(".panel-body > h4"),
-			created_datetime: e.ChildText(".panel-heading > p"),
-			location:         sanitizeLocationString(e.ChildText(".panel-body > p.lead")),
+			district:         district,
+			created_datetime: created_datetime,
+			location:         sanitizeLocationString(location),
 		}
 
 		sc = append(sc, speed_control)
 
-	})
-	c.OnRequest(func(r *colly.Request) {
-		fmt.Println("Visiting", r.URL)
-	})
-
-	c.Visit("https://temporeal.radaresdeportugal.pt/")
-
+	}
 	return sc
 }
 
@@ -102,14 +119,18 @@ func main() {
 	valueArgs := make([]interface{}, 0, len(speedControls)*3)
 
 	for _, sc := range speedControls {
-		created_datetime := createdDatetimeToTimestamp(sc.created_datetime)
+		created_datetime := createdDatetimeToTimestamp(strings.TrimSpace(sc.created_datetime))
 
-		if !emptyTable && created_datetime > mostRecentCreatedDatetime.Int64 {
-			valueStrings = append(valueStrings, "(?, ?, ?)")
-			valueArgs = append(valueArgs, sc.district)
-			valueArgs = append(valueArgs, created_datetime)
-			valueArgs = append(valueArgs, sc.location)
+		// If the new entry is older than the most recent saved speed control, no need to save it,
+		// because it's outdated info
+		if !emptyTable && created_datetime < mostRecentCreatedDatetime.Int64 {
+			break
 		}
+
+		valueStrings = append(valueStrings, "(?, ?, ?)")
+		valueArgs = append(valueArgs, sc.district)
+		valueArgs = append(valueArgs, created_datetime)
+		valueArgs = append(valueArgs, sc.location)
 	}
 
 	if len(valueStrings) > 0 {
